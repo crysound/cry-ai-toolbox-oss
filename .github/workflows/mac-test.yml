@@ -1,0 +1,68 @@
+# 测试包构建：源码以加密附件放在草稿发布里，构建产物加密后传回同一草稿；
+# 不用 upload-artifact，日志里不出现源码和产物。只能手动触发。
+name: mac-test
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: draft release id
+        required: true
+      asset_id:
+        description: encrypted source asset id
+        required: true
+      version:
+        description: version (1.0.N)
+        required: true
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PASS: ${{ secrets.ARTIFACT_PASSPHRASE }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      ASSET_ID: ${{ inputs.asset_id }}
+      VERSION: ${{ inputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: fetch and decrypt source
+        run: |
+          set -eo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ && "$ASSET_ID" =~ ^[0-9]+$ && "$VERSION" =~ ^1\.0\.[0-9]+$ ]]
+          OSSL="$(brew --prefix openssl@3)/bin/openssl"
+          gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" > src.enc
+          mkdir src
+          "$OSSL" enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:PASS -in src.enc | tar xz -C src
+          rm src.enc
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: false
+      - name: build app
+        working-directory: src
+        run: |
+          set -eo pipefail
+          make app BRAND=corp VERSION="$VERSION"
+          codesign --force --deep -s - cry-ai-toolbox.app
+          codesign --verify --deep --strict cry-ai-toolbox.app
+          lipo -archs cry-ai-toolbox.app/Contents/MacOS/cry-ai-toolbox
+          ditto -c -k --keepParent cry-ai-toolbox.app "../cry-ai-toolbox-$VERSION-macos-$ARCH.zip"
+      - name: encrypt and upload
+        run: |
+          set -eo pipefail
+          OSSL="$(brew --prefix openssl@3)/bin/openssl"
+          f="cry-ai-toolbox-$VERSION-macos-$ARCH.zip"
+          "$OSSL" enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:PASS -in "$f" -out "$f.enc"
+          shasum -a 256 "$f" | cut -c1-16
+          curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/octet-stream' \
+            --data-binary @"$f.enc" "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$f.enc" > /dev/null
